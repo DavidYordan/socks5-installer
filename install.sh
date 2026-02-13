@@ -21,10 +21,12 @@ INSTALL_MODE="${INSTALL_MODE:-upgrade}"     # upgrade|reinstall|skip
 KEEP_CONFIG="${KEEP_CONFIG:-0}"             # 1=keep existing config; 0=overwrite config
 PIN_REF="${PIN_REF:-master}"                # master|tag|commit hash
 
-# Build behavior
-# IMPORTANT: We APPEND these flags to upstream Makefile flags (do NOT override),
-# otherwise you may hit missing macros (e.g., nfds_t) or unwanted ODBC deps (sqltypes.h).
-BUILD_CFLAGS="${BUILD_CFLAGS:- -Wno-error=format -Wno-format }"
+# build behavior
+# IMPORTANT:
+# Do NOT pass CFLAGS on the make command line (even CFLAGS+=) because it propagates into sub-makes
+# and can override upstream feature macros, causing errors like nfds_t missing.
+# Instead we patch Makefile.inc to append extra flags safely.
+EXTRA_CFLAGS="${EXTRA_CFLAGS:- -Wno-error=format -Wno-format }"
 ENABLE_ODBC="${ENABLE_ODBC:-0}"             # 1=enable ODBC build (requires dev headers), 0=disable ODBC for compatibility
 
 # ----------------------------
@@ -210,23 +212,48 @@ git_prepare_source() {
   popd >/dev/null
 }
 
+patch_makefile_inc() {
+  # We patch src/Makefile.inc to append extra flags without overriding upstream flags/macros.
+  local mf="${SRC_DIR}/src/Makefile.inc"
+  if [[ ! -f "$mf" ]]; then
+    # Fallback: try to locate Makefile.inc under repo
+    mf="$(find "$SRC_DIR" -maxdepth 3 -type f -name 'Makefile.inc' | head -n 1 || true)"
+  fi
+  if [[ -z "$mf" || ! -f "$mf" ]]; then
+    echo "ERROR: cannot find Makefile.inc to patch."
+    exit 1
+  fi
+
+  # Idempotent patch
+  if grep -q "socks5-installer: extra flags" "$mf"; then
+    return 0
+  fi
+
+  local odbc_flag=""
+  if [[ "$ENABLE_ODBC" != "1" ]]; then
+    odbc_flag="-DNOODBC"
+  fi
+
+  # Add feature macros to avoid platform-dependent header exposure issues (e.g., nfds_t)
+  # Duplicates are harmless if upstream already defines them.
+  cat >>"$mf" <<EOF
+
+# socks5-installer: extra flags (appended; safe & idempotent)
+CFLAGS += ${EXTRA_CFLAGS} ${odbc_flag} -D_GNU_SOURCE -D_POSIX_C_SOURCE=200112L -D_REENTRANT -D_THREAD_SAFE
+
+EOF
+}
+
 build_3proxy() {
   git_prepare_source
   pushd "$SRC_DIR" >/dev/null
 
   ln -sf Makefile.Linux Makefile
 
-  # Keep upstream flags intact; only APPEND our extras.
-  # Also disable ODBC by default for better compatibility unless ENABLE_ODBC=1.
-  local odbc_flag="-DNOODBC"
-  if [[ "$ENABLE_ODBC" == "1" ]]; then
-    odbc_flag=""
-  fi
+  patch_makefile_inc
 
   make clean >/dev/null 2>&1 || true
-
-  # NOTE: Use CFLAGS+= to avoid overriding Makefile's required feature macros (e.g. _GNU_SOURCE, WITH_POLL, etc.)
-  make -j"$(nproc || echo 2)" CFLAGS+="${BUILD_CFLAGS} ${odbc_flag}"
+  make -j"$(nproc || echo 2)"
 
   # Install binary: 3proxy typically outputs to ./bin/3proxy
   if [[ -x ./bin/3proxy ]]; then
@@ -256,6 +283,7 @@ print_result() {
   else
     echo "Allow CIDR:(not set)"
   fi
+  echo "ODBC:      $( [[ "$ENABLE_ODBC" == "1" ]] && echo enabled || echo disabled )"
   echo ""
   echo "Binary:    ${BIN_PATH}"
   echo "Config:    ${CONFIG_DIR}/3proxy.cfg"
