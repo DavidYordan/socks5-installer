@@ -20,7 +20,12 @@ SERVICE_NAME="${SERVICE_NAME:-socks5-3proxy}"
 INSTALL_MODE="${INSTALL_MODE:-upgrade}"     # upgrade|reinstall|skip
 KEEP_CONFIG="${KEEP_CONFIG:-0}"             # 1=keep existing config; 0=overwrite config
 PIN_REF="${PIN_REF:-master}"                # master|tag|commit hash
-BUILD_CFLAGS="${BUILD_CFLAGS:- -O2 -pipe -fPIC -Wno-error=format -Wno-format }"
+
+# Build behavior
+# IMPORTANT: We APPEND these flags to upstream Makefile flags (do NOT override),
+# otherwise you may hit missing macros (e.g., nfds_t) or unwanted ODBC deps (sqltypes.h).
+BUILD_CFLAGS="${BUILD_CFLAGS:- -Wno-error=format -Wno-format }"
+ENABLE_ODBC="${ENABLE_ODBC:-0}"             # 1=enable ODBC build (requires dev headers), 0=disable ODBC for compatibility
 
 # ----------------------------
 # Helpers
@@ -211,9 +216,19 @@ build_3proxy() {
 
   ln -sf Makefile.Linux Makefile
 
-  make clean >/dev/null 2>&1 || true
-  make -j"$(nproc || echo 2)" CFLAGS="${BUILD_CFLAGS}"
+  # Keep upstream flags intact; only APPEND our extras.
+  # Also disable ODBC by default for better compatibility unless ENABLE_ODBC=1.
+  local odbc_flag="-DNOODBC"
+  if [[ "$ENABLE_ODBC" == "1" ]]; then
+    odbc_flag=""
+  fi
 
+  make clean >/dev/null 2>&1 || true
+
+  # NOTE: Use CFLAGS+= to avoid overriding Makefile's required feature macros (e.g. _GNU_SOURCE, WITH_POLL, etc.)
+  make -j"$(nproc || echo 2)" CFLAGS+="${BUILD_CFLAGS} ${odbc_flag}"
+
+  # Install binary: 3proxy typically outputs to ./bin/3proxy
   if [[ -x ./bin/3proxy ]]; then
     install -m 0755 ./bin/3proxy "$BIN_PATH"
   elif [[ -x ./src/3proxy ]]; then

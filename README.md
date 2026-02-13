@@ -11,6 +11,7 @@ It supports:
 - Optional firewall allow-list via `ALLOW_CIDR`
 - **systemd service** auto setup when systemd is present
 - **Repeatable installs** with `INSTALL_MODE` and `KEEP_CONFIG`
+- **Cross-distro build robustness**: avoids overriding upstream Makefile flags; disables ODBC by default to prevent `sqltypes.h` build failures
 
 > ⚠️ If you expose SOCKS5 to the Internet, always apply an allow-list (`ALLOW_CIDR`) and also restrict in your cloud security group.
 
@@ -87,7 +88,8 @@ All parameters are set via **environment variables**.
 | `CONFIG_DIR` | `/etc/3proxy` | Config directory |
 | `BIN_PATH` | `/usr/local/bin/3proxy` | Installed binary path |
 | `SERVICE_NAME` | `socks5-3proxy` | systemd service name |
-| `BUILD_CFLAGS` | *(safe defaults)* | Override build CFLAGS |
+| `BUILD_CFLAGS` | *(safe defaults)* | **Additional** build flags appended to upstream Makefile (not overriding) |
+| `ENABLE_ODBC` | `0` | `1` to enable ODBC build (requires ODBC dev headers), `0` disables ODBC to improve compatibility |
 
 ### What is `ALLOW_CIDR`?
 `ALLOW_CIDR` is a **CIDR allow-list** describing which source IPs/networks can connect to your SOCKS port.
@@ -233,28 +235,49 @@ curl -fsSL https://raw.githubusercontent.com/DavidYordan/socks5-installer/main/i
 
 ## Troubleshooting
 
-### 1) Install says it failed but build succeeded
-If you see:
+### 1) Build fails with `sqltypes.h: No such file or directory`
+This happens when building with ODBC enabled but the ODBC dev headers are missing.
 
-- `install: cannot stat './src/3proxy': No such file or directory`
+By default, this installer disables ODBC for better compatibility (`ENABLE_ODBC=0`).
+If you want ODBC, install headers and enable it:
 
-It means the binary is likely in `./bin/3proxy` (common for 3proxy). This repo’s installer detects both `bin/3proxy` and `src/3proxy`.
+Ubuntu/Debian:
+```bash
+sudo apt-get update -y
+sudo apt-get install -y unixodbc-dev
+```
 
-### 2) Service is running but cannot connect
+CentOS/RHEL:
+```bash
+sudo yum install -y unixODBC-devel
+# or: sudo dnf install -y unixODBC-devel
+```
+
+Then:
+```bash
+curl -fsSL https://raw.githubusercontent.com/DavidYordan/socks5-installer/main/install.sh | sudo \
+  ENABLE_ODBC=1 bash
+```
+
+### 2) Build fails with `unknown type name 'nfds_t'`
+This typically indicates the upstream Makefile feature macros were not applied.
+This installer avoids overriding upstream CFLAGS and instead appends `BUILD_CFLAGS` (so the required macros remain intact).
+
+### 3) Service is running but cannot connect
 Check:
 - Cloud security group inbound rules
 - Firewall rules (`ufw` or `firewalld`)
 - `BIND_ADDR` is correct (`127.0.0.1` only accepts local)
 - Access is allowed by your `ALLOW_CIDR`
 
-### 3) See config and listen port
+### 4) See config and listen port
 
 ```bash
 cat /etc/3proxy/3proxy.cfg
 ss -lntp | grep 3proxy || true
 ```
 
-### 4) See logs
+### 5) See logs
 
 ```bash
 sudo journalctl -u socks5-3proxy -e --no-pager
