@@ -1,13 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ============================
+# SOCKS5 Installer (3proxy)
+# ============================
+# 修复点总结（你刚才遇到的两个坑）：
+# 1) 编译阶段：
+#    - 直接在 make 命令行传 CFLAGS（哪怕 CFLAGS+=）会在子 make 中覆盖/干扰上游宏，
+#      导致 nfds_t 等类型缺失、或意外启用 ODBC 触发 sqltypes.h 缺失。
+#    - 解决：不在 make 命令行传 CFLAGS；改为“补丁式”追加到 src/Makefile.inc。
+#
+# 2) 运行阶段：
+#    - 你的 config 里原来用 socks -i0.0.0.0，部分环境下这会导致 3proxy 不正常监听/直接退出。
+#      （0.0.0.0 最稳的写法是：不写 -i，让它默认 bind all）
+#    - 同时 config 使用 daemon 时，3proxy 会 fork 到后台并让前台进程退出（exit 0），
+#      systemd 若用 Type=simple 会显示服务 dead（但后台可能还在跑，或被 systemd/cgroup 清理）。
+#    - 解决：systemd 一律用 Type=forking + PIDFile，并在 config 写 pidfile；
+#      bind 0.0.0.0 时不加 -i。
+
 # ----------------------------
 # Config (env overrides allowed)
 # ----------------------------
 SOCKS_USER="${SOCKS_USER:-socks}"
 SOCKS_PASS="${SOCKS_PASS:-}"                # empty => random
 SOCKS_PORT="${SOCKS_PORT:-1080}"            # "random" => random port
-BIND_ADDR="${BIND_ADDR:-127.0.0.1}"         # default safe: localhost only
+BIND_ADDR="${BIND_ADDR:-127.0.0.1}"         # default safe: localhost only; for all interfaces set 0.0.0.0
 ALLOW_CIDR="${ALLOW_CIDR:-}"                # recommended when BIND_ADDR != 127.0.0.1
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/3proxy}"
@@ -22,12 +39,12 @@ KEEP_CONFIG="${KEEP_CONFIG:-0}"             # 1=keep existing config; 0=overwrit
 PIN_REF="${PIN_REF:-master}"                # master|tag|commit hash
 
 # build behavior
-# IMPORTANT:
-# Do NOT pass CFLAGS on the make command line (even CFLAGS+=) because it propagates into sub-makes
-# and can override upstream feature macros, causing errors like nfds_t missing.
-# Instead we patch Makefile.inc to append extra flags safely.
+# 不在 make 命令行传 CFLAGS，改为 patch Makefile.inc 追加
 EXTRA_CFLAGS="${EXTRA_CFLAGS:- -Wno-error=format -Wno-format }"
 ENABLE_ODBC="${ENABLE_ODBC:-0}"             # 1=enable ODBC build (requires dev headers), 0=disable ODBC for compatibility
+
+# runtime behavior
+PIDFILE="${PIDFILE:-/run/3proxy.pid}"
 
 # ----------------------------
 # Helpers
@@ -75,6 +92,15 @@ install_deps() {
     echo "ERROR: unsupported package manager. Please install: git gcc make openssl-dev python3"
     exit 1
   fi
+
+  # 如果用户显式开启 ODBC，就尝试装 ODBC 头文件（可选）
+  if [[ "${ENABLE_ODBC}" == "1" ]]; then
+    if [[ "$pm" == "apt" ]]; then
+      apt-get install -y unixodbc-dev || true
+    elif [[ "$pm" == "dnf" || "$pm" == "yum" ]]; then
+      (dnf -y install unixODBC-devel || yum -y install unixODBC-devel) || true
+    fi
+  fi
 }
 
 have_systemd() {
@@ -117,27 +143,31 @@ uninstall_everything() {
 }
 
 open_firewall_port() {
+  # Only attempt if user provided ALLOW_CIDR and BIND_ADDR is not localhost
   if [[ "$BIND_ADDR" == "127.0.0.1" ]]; then
     return 0
   fi
 
   if [[ -z "$ALLOW_CIDR" ]]; then
     echo "WARN: BIND_ADDR != 127.0.0.1 but ALLOW_CIDR is empty."
-    echo "      Strongly recommended: restrict access via firewall (ALLOW_CIDR=x.x.x.x/32)."
+    echo "      Strongly recommended: restrict access via firewall/security-group (ALLOW_CIDR=x.x.x.x/32)."
     return 0
   fi
 
+  # UFW (Ubuntu common)
   if command -v ufw >/dev/null 2>&1; then
     ufw allow from "$ALLOW_CIDR" to any port "$SOCKS_PORT" proto tcp >/dev/null || true
     return 0
   fi
 
+  # firewalld (CentOS/RHEL common)
   if command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=${ALLOW_CIDR} port port=${SOCKS_PORT} protocol=tcp accept" >/dev/null || true
     firewall-cmd --reload >/dev/null || true
     return 0
   fi
 
+  # iptables fallback (best-effort)
   if command -v iptables >/dev/null 2>&1; then
     iptables -I INPUT -p tcp --dport "$SOCKS_PORT" -s "$ALLOW_CIDR" -j ACCEPT || true
     iptables -I INPUT -p tcp --dport "$SOCKS_PORT" -j DROP || true
@@ -145,6 +175,9 @@ open_firewall_port() {
   fi
 }
 
+# ----------------------------
+# Config/service generation
+# ----------------------------
 write_config() {
   mkdir -p "$CONFIG_DIR"
 
@@ -153,8 +186,19 @@ write_config() {
     return 0
   fi
 
+  # bind 逻辑：
+  # - 0.0.0.0：不要写 -i（你刚刚验证过 socks -pPORT 最稳定）
+  # - 127.0.0.1 或具体 IP：写 -i<IP> 用于限制监听网卡
+  local socks_line=""
+  if [[ "$BIND_ADDR" == "0.0.0.0" || -z "$BIND_ADDR" ]]; then
+    socks_line="socks -p${SOCKS_PORT}"
+  else
+    socks_line="socks -p${SOCKS_PORT} -i${BIND_ADDR}"
+  fi
+
   cat >"${CONFIG_DIR}/3proxy.cfg" <<EOF
 daemon
+pidfile ${PIDFILE}
 nscache 65536
 timeouts 1 5 30 60 180 1800 15 60
 
@@ -164,24 +208,29 @@ auth strong
 allow ${SOCKS_USER}
 
 # SOCKS5 listener
-# -i internal(bind) address, -p port
-socks -p${SOCKS_PORT} -i${BIND_ADDR}
+${socks_line}
 EOF
 }
 
 write_systemd() {
   mkdir -p /etc/systemd/system
+
+  # 使用 Type=forking + PIDFile，避免 daemon 模式下 systemd 显示 dead 或清理子进程的问题
   cat >/etc/systemd/system/${SERVICE_NAME}.service <<EOF
 [Unit]
 Description=SOCKS5 proxy (3proxy)
 After=network.target
 
 [Service]
-Type=simple
+Type=forking
+PIDFile=${PIDFILE}
+ExecStartPre=/bin/rm -f ${PIDFILE}
 ExecStart=${BIN_PATH} ${CONFIG_DIR}/3proxy.cfg
 Restart=on-failure
 RestartSec=2
 LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -192,6 +241,9 @@ EOF
   systemctl restart "${SERVICE_NAME}.service" || true
 }
 
+# ----------------------------
+# Build 3proxy
+# ----------------------------
 git_prepare_source() {
   mkdir -p "$INSTALL_DIR"
 
@@ -202,10 +254,8 @@ git_prepare_source() {
     git -C "$SRC_DIR" fetch --all --prune
   fi
 
-  # Checkout pinned ref (tag/commit/branch)
   pushd "$SRC_DIR" >/dev/null
   git checkout -f "$PIN_REF" >/dev/null 2>&1 || git checkout -f "origin/$PIN_REF" >/dev/null 2>&1 || true
-  # If PIN_REF is master-like, keep updated
   if [[ "$PIN_REF" == "master" || "$PIN_REF" == "main" ]]; then
     git reset --hard "origin/$PIN_REF" >/dev/null 2>&1 || true
   fi
@@ -213,10 +263,8 @@ git_prepare_source() {
 }
 
 patch_makefile_inc() {
-  # We patch src/Makefile.inc to append extra flags without overriding upstream flags/macros.
   local mf="${SRC_DIR}/src/Makefile.inc"
   if [[ ! -f "$mf" ]]; then
-    # Fallback: try to locate Makefile.inc under repo
     mf="$(find "$SRC_DIR" -maxdepth 3 -type f -name 'Makefile.inc' | head -n 1 || true)"
   fi
   if [[ -z "$mf" || ! -f "$mf" ]]; then
@@ -234,11 +282,12 @@ patch_makefile_inc() {
     odbc_flag="-DNOODBC"
   fi
 
-  # Add feature macros to avoid platform-dependent header exposure issues (e.g., nfds_t)
-  # Duplicates are harmless if upstream already defines them.
   cat >>"$mf" <<EOF
 
 # socks5-installer: extra flags (appended; safe & idempotent)
+# - keep upstream feature macros intact
+# - disable ODBC by default to avoid sqltypes.h missing
+# - ensure nfds_t/poll related types are visible even on strict libc feature sets
 CFLAGS += ${EXTRA_CFLAGS} ${odbc_flag} -D_GNU_SOURCE -D_POSIX_C_SOURCE=200112L -D_REENTRANT -D_THREAD_SAFE
 
 EOF
@@ -249,13 +298,11 @@ build_3proxy() {
   pushd "$SRC_DIR" >/dev/null
 
   ln -sf Makefile.Linux Makefile
-
   patch_makefile_inc
 
   make clean >/dev/null 2>&1 || true
   make -j"$(nproc || echo 2)"
 
-  # Install binary: 3proxy typically outputs to ./bin/3proxy
   if [[ -x ./bin/3proxy ]]; then
     install -m 0755 ./bin/3proxy "$BIN_PATH"
   elif [[ -x ./src/3proxy ]]; then
@@ -270,6 +317,9 @@ build_3proxy() {
   popd >/dev/null
 }
 
+# ----------------------------
+# Output
+# ----------------------------
 print_result() {
   echo "================================================="
   echo "SOCKS5 installed ✅"
@@ -302,7 +352,6 @@ print_result() {
 main() {
   need_root
 
-  # Normalize mode
   case "$INSTALL_MODE" in
     upgrade|reinstall|skip) ;;
     *)
@@ -311,7 +360,6 @@ main() {
       ;;
   esac
 
-  # If skip and already installed, exit
   if [[ "$INSTALL_MODE" == "skip" && -x "$BIN_PATH" ]]; then
     echo "Already installed at ${BIN_PATH}; INSTALL_MODE=skip -> exit."
     exit 0
@@ -326,7 +374,6 @@ main() {
     SOCKS_PASS="$(rand_pass)"
   fi
 
-  # If reinstall: stop & remove old bits first
   if [[ "$INSTALL_MODE" == "reinstall" ]]; then
     uninstall_everything
   fi
