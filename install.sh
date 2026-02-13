@@ -9,10 +9,18 @@ SOCKS_PASS="${SOCKS_PASS:-}"                # empty => random
 SOCKS_PORT="${SOCKS_PORT:-1080}"            # "random" => random port
 BIND_ADDR="${BIND_ADDR:-127.0.0.1}"         # default safe: localhost only
 ALLOW_CIDR="${ALLOW_CIDR:-}"                # recommended when BIND_ADDR != 127.0.0.1
+
 INSTALL_DIR="${INSTALL_DIR:-/opt/3proxy}"
+SRC_DIR="${SRC_DIR:-${INSTALL_DIR}/3proxy}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/3proxy}"
 BIN_PATH="${BIN_PATH:-/usr/local/bin/3proxy}"
 SERVICE_NAME="${SERVICE_NAME:-socks5-3proxy}"
+
+# install behavior
+INSTALL_MODE="${INSTALL_MODE:-upgrade}"     # upgrade|reinstall|skip
+KEEP_CONFIG="${KEEP_CONFIG:-0}"             # 1=keep existing config; 0=overwrite config
+PIN_REF="${PIN_REF:-master}"                # master|tag|commit hash
+BUILD_CFLAGS="${BUILD_CFLAGS:- -O2 -pipe -fPIC -Wno-error=format -Wno-format }"
 
 # ----------------------------
 # Helpers
@@ -25,7 +33,6 @@ need_root() {
 }
 
 rand_port() {
-  # 20000-60000
   python3 - <<'PY'
 import random
 print(random.randint(20000, 60000))
@@ -33,7 +40,6 @@ PY
 }
 
 rand_pass() {
-  # 18 bytes base64-ish (avoid / +)
   python3 - <<'PY'
 import os, base64
 s = base64.b64encode(os.urandom(18)).decode()
@@ -68,8 +74,42 @@ have_systemd() {
   command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
 }
 
+service_exists() {
+  [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]] || \
+  (have_systemd && systemctl list-unit-files | awk '{print $1}' | grep -qx "${SERVICE_NAME}.service")
+}
+
+stop_service() {
+  if have_systemd && service_exists; then
+    systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+  fi
+}
+
+remove_service_file() {
+  if [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]]; then
+    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+  fi
+  if have_systemd; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+}
+
+uninstall_everything() {
+  stop_service
+  remove_service_file
+
+  rm -f "$BIN_PATH" 2>/dev/null || true
+
+  # config removal only if KEEP_CONFIG=0 and mode is reinstall
+  if [[ "$KEEP_CONFIG" != "1" ]]; then
+    rm -rf "$CONFIG_DIR" 2>/dev/null || true
+  fi
+
+  # remove source/build dir only in reinstall
+  rm -rf "$SRC_DIR" 2>/dev/null || true
+}
+
 open_firewall_port() {
-  # Only attempt if user provided ALLOW_CIDR and BIND_ADDR is not localhost
   if [[ "$BIND_ADDR" == "127.0.0.1" ]]; then
     return 0
   fi
@@ -80,20 +120,17 @@ open_firewall_port() {
     return 0
   fi
 
-  # UFW (Ubuntu common)
   if command -v ufw >/dev/null 2>&1; then
     ufw allow from "$ALLOW_CIDR" to any port "$SOCKS_PORT" proto tcp >/dev/null || true
     return 0
   fi
 
-  # firewalld (CentOS/RHEL common)
   if command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=${ALLOW_CIDR} port port=${SOCKS_PORT} protocol=tcp accept" >/dev/null || true
     firewall-cmd --reload >/dev/null || true
     return 0
   fi
 
-  # iptables fallback (best-effort)
   if command -v iptables >/dev/null 2>&1; then
     iptables -I INPUT -p tcp --dport "$SOCKS_PORT" -s "$ALLOW_CIDR" -j ACCEPT || true
     iptables -I INPUT -p tcp --dport "$SOCKS_PORT" -j DROP || true
@@ -103,6 +140,12 @@ open_firewall_port() {
 
 write_config() {
   mkdir -p "$CONFIG_DIR"
+
+  # If KEEP_CONFIG=1 and config exists, do nothing
+  if [[ "$KEEP_CONFIG" == "1" && -f "${CONFIG_DIR}/3proxy.cfg" ]]; then
+    return 0
+  fi
+
   cat >"${CONFIG_DIR}/3proxy.cfg" <<EOF
 daemon
 nscache 65536
@@ -139,24 +182,56 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now "${SERVICE_NAME}.service"
+  systemctl restart "${SERVICE_NAME}.service" || true
+}
+
+git_prepare_source() {
+  mkdir -p "$INSTALL_DIR"
+
+  if [[ ! -d "${SRC_DIR}/.git" ]]; then
+    rm -rf "$SRC_DIR" 2>/dev/null || true
+    git clone https://github.com/z3APA3A/3proxy "$SRC_DIR"
+  else
+    git -C "$SRC_DIR" fetch --all --prune
+  fi
+
+  # Checkout pinned ref (tag/commit/branch)
+  pushd "$SRC_DIR" >/dev/null
+  git checkout -f "$PIN_REF" >/dev/null 2>&1 || git checkout -f "origin/$PIN_REF" >/dev/null 2>&1 || true
+  # If PIN_REF is master-like, keep updated
+  if [[ "$PIN_REF" == "master" || "$PIN_REF" == "main" ]]; then
+    git reset --hard "origin/$PIN_REF" >/dev/null 2>&1 || true
+  fi
+  popd >/dev/null
 }
 
 build_3proxy() {
-  mkdir -p "$INSTALL_DIR"
-  if [[ ! -d "${INSTALL_DIR}/3proxy" ]]; then
-    git clone https://github.com/z3APA3A/3proxy "${INSTALL_DIR}/3proxy"
-  fi
-  pushd "${INSTALL_DIR}/3proxy" >/dev/null
+  git_prepare_source
+  pushd "$SRC_DIR" >/dev/null
+
   ln -sf Makefile.Linux Makefile
-  make -j"$(nproc || echo 2)"
-  # place binary in a stable path
-  install -m 0755 ./src/3proxy "$BIN_PATH"
+
+  make clean >/dev/null 2>&1 || true
+  make -j"$(nproc || echo 2)" CFLAGS="${BUILD_CFLAGS}"
+
+  if [[ -x ./bin/3proxy ]]; then
+    install -m 0755 ./bin/3proxy "$BIN_PATH"
+  elif [[ -x ./src/3proxy ]]; then
+    install -m 0755 ./src/3proxy "$BIN_PATH"
+  else
+    echo "ERROR: 3proxy binary not found after build."
+    echo "Debug listing (top 4 levels):"
+    find . -maxdepth 4 -type f -name 3proxy -print
+    exit 1
+  fi
+
   popd >/dev/null
 }
 
 print_result() {
   echo "================================================="
   echo "SOCKS5 installed ✅"
+  echo "Mode:      ${INSTALL_MODE} (KEEP_CONFIG=${KEEP_CONFIG})"
   echo "User:      ${SOCKS_USER}"
   echo "Password:  ${SOCKS_PASS}"
   echo "Bind:      ${BIND_ADDR}"
@@ -167,6 +242,7 @@ print_result() {
     echo "Allow CIDR:(not set)"
   fi
   echo ""
+  echo "Binary:    ${BIN_PATH}"
   echo "Config:    ${CONFIG_DIR}/3proxy.cfg"
   if have_systemd; then
     echo "Service:   systemctl status ${SERVICE_NAME} --no-pager"
@@ -182,6 +258,22 @@ print_result() {
 
 main() {
   need_root
+
+  # Normalize mode
+  case "$INSTALL_MODE" in
+    upgrade|reinstall|skip) ;;
+    *)
+      echo "ERROR: INSTALL_MODE must be one of: upgrade|reinstall|skip"
+      exit 1
+      ;;
+  esac
+
+  # If skip and already installed, exit
+  if [[ "$INSTALL_MODE" == "skip" && -x "$BIN_PATH" ]]; then
+    echo "Already installed at ${BIN_PATH}; INSTALL_MODE=skip -> exit."
+    exit 0
+  fi
+
   install_deps
 
   if [[ "$SOCKS_PORT" == "random" ]]; then
@@ -189,6 +281,11 @@ main() {
   fi
   if [[ -z "$SOCKS_PASS" ]]; then
     SOCKS_PASS="$(rand_pass)"
+  fi
+
+  # If reinstall: stop & remove old bits first
+  if [[ "$INSTALL_MODE" == "reinstall" ]]; then
+    uninstall_everything
   fi
 
   build_3proxy
